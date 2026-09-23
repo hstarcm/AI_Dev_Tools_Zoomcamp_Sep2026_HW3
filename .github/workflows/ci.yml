@@ -1,0 +1,82 @@
+name: CI / CD Pipeline
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  test-and-deploy:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: relay
+          POSTGRES_PASSWORD: relaypassword
+          POSTGRES_DB: agent_relay
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U relay -d agent_relay"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run tests against PostgreSQL
+        env:
+          RELAY_DATABASE_URL: postgresql+psycopg://relay:relaypassword@localhost:5432/agent_relay
+        run: uv run pytest -v
+
+      - name: Compute unique image tag
+        id: vars
+        shell: bash
+        run: |
+          TAG=$(git rev-parse --short HEAD 2>/dev/null || date +%s)
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Build Docker image
+        run: |
+          docker build -t agent-relay:${{ steps.vars.outputs.tag }} .
+
+      - name: Ensure kind CLI is available
+        shell: bash
+        run: |
+          if ! command -v kind &> /dev/null; then
+            curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.27.0/kind-linux-amd64
+            chmod +x ./kind
+            sudo mv ./kind /usr/local/bin/kind
+          fi
+
+      - name: Load image into kind cluster
+        run: |
+          kind load docker-image agent-relay:${{ steps.vars.outputs.tag }} --name agent-relay-cluster
+
+      - name: Deploy new image to kind cluster
+        run: |
+          kubectl set image deployment/agent-relay agent-relay=agent-relay:${{ steps.vars.outputs.tag }}
+
+      - name: Wait for rollout to finish
+        run: |
+          kubectl rollout status deployment/agent-relay --timeout=120s
+
